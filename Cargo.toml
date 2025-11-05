@@ -2,6 +2,20 @@
 name = "rargz"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.82"
+authors = ["Frank Stallion <frank.stallion@ojefe.com>"]
+description = "Fast parallel tar + zstd archiver and extractor with optional chunked format."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/fibnas/rargz"
+homepage = "https://github.com/fibnas/rargz"
+documentation = "https://docs.rs/rargz"
+keywords = ["tar", "zstd", "archive", "compression", "cli"]
+categories = ["compression", "command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "rargz"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
