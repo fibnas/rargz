@@ -1,0 +1,51 @@
+# Ignore build outputs
+target/
+*.log
+*.bak
+*.old
+
+# Local configs and envs
+.env
+*.env
+.DS_Store
+.idea/
+.vscode/
+
+# Large assets or screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+
+# Except those in assets/
+!assets/**
+
+# IDE and editor cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.orig
+
+# Backup or system files
+*.tmp
+*.cache
+.cache/
+logs/
+tests/tmp/
+temp/
+
+# Local data files not needed for publish
+entries.json
+
+# Docs or notes not needed on crates.io
+notes/
+screenshots/
+
+temp/
+md_specs/
+
+Cargo.toml.orig
+

@@ -1,0 +1,21 @@
+# Mark asset files as documentation, not code
+assets/* linguist-documentation
+
+# Normalize line endings to LF across all environments
+* text=auto eol=lf
+
+# Explicitly define file types for GitHub Linguist
+*.rs linguist-language=Rust
+*.toml linguist-language=TOML
+*.md linguist-language=Markdown
+
+# Ensure Cargo.lock is treated as text
+Cargo.lock text
+
+# Exclude built artifacts from diffs
+/target/* linguist-vendored
+
+# Make sure LICENSE and README are recognized correctly
+LICENSE linguist-documentation
+README.md linguist-documentation
+

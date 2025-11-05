@@ -1,0 +1,42 @@
+# === Build outputs ===
+debug/
+target/
+
+# === Local temp & dev directories ===
+temp/
+md_specs/
+
+# === Logs, caches, backups ===
+*.log
+*.bak
+*.old
+*.tmp
+*.cache
+.cache/
+logs/
+tests/tmp/
+
+# === Media / large files ===
+
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+
+# === Editor and merge leftovers ===
+*.swp
+*.swo
+*~
+*.orig
+**/*.rs.bk
+
+# === OS & IDE clutter ===
+.DS_Store
+.idea/
+.vscode/
+
+# === Tooling / generated data ===
+**/mutants.out*/
+*.pdb
+
+Cargo.lock
