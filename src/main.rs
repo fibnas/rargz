@@ -1,24 +1,35 @@
 use anyhow::{Context, Result, anyhow, bail};
+use atty::Stream;
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender};
 use rayon::ThreadPoolBuilder;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::convert::TryFrom;
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
+use std::time::Duration;
 use walkdir::WalkDir;
-use zstd::bulk::Compressor;
+use zstd::bulk::{Compressor, Decompressor};
+use zstd::stream::read::Decoder as ZstdDecoder;
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 /// Create a tar archive from `PATH` and compress it with zstd, writing to stdout.
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum ArchiveFormat {
+    TarZst,
+    Rargz,
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "rargz", version, about = "Parallel tar + zstd archiver")]
+#[command(name = "rargz", version, about = "Parallel tar + zstd archiver/extractor")]
 struct Args {
     /// Directory or file to archive.
-    #[arg(value_name = "PATH")]
-    input: PathBuf,
+    #[arg(value_name = "PATH", required_unless_present("extract"))]
+    input: Option<PathBuf>,
 
     /// Zstd compression level.
     #[arg(short = 'l', long, default_value_t = 3)]
@@ -31,6 +42,114 @@ struct Args {
     /// Number of worker threads for compression.
     #[arg(short = 'j', long, value_name = "THREADS")]
     jobs: Option<usize>,
+
+    /// Extract from stdin into the output directory.
+    #[arg(short = 'x', long)]
+    extract: bool,
+
+    /// Output directory for extraction.
+    #[arg(short = 'o', long, value_name = "DIR")]
+    output: Option<PathBuf>,
+
+    /// Output format for the archive.
+    #[arg(long, default_value_t = ArchiveFormat::TarZst, value_enum)]
+    format: ArchiveFormat,
+
+    /// Disable progress reporting.
+    #[arg(long)]
+    no_progress: bool,
+}
+
+fn progress_allowed(no_progress: bool) -> bool {
+    !no_progress && atty::is(Stream::Stderr)
+}
+
+#[derive(Clone)]
+struct ProgressReporter {
+    inner: Option<Arc<ProgressInner>>,
+}
+
+struct ProgressInner {
+    bar: ProgressBar,
+    files: AtomicU64,
+    bytes: AtomicU64,
+    finished: AtomicBool,
+}
+
+enum InputFormat {
+    TarZst,
+    Rargz { chunk_size: usize },
+}
+
+impl ProgressReporter {
+    fn new(label: impl Into<String>, enabled: bool) -> Self {
+        if !enabled {
+            return Self { inner: None };
+        }
+
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(
+            ProgressStyle::with_template("{prefix:.bold} {spinner} {wide_msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        bar.enable_steady_tick(Duration::from_millis(120));
+        let label = label.into();
+        bar.set_prefix(label);
+        let inner = Arc::new(ProgressInner {
+            bar,
+            files: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            finished: AtomicBool::new(false),
+        });
+        inner.update_message();
+        Self { inner: Some(inner) }
+    }
+
+    fn record_file(&self) {
+        if let Some(inner) = &self.inner {
+            inner.files.fetch_add(1, Ordering::Relaxed);
+            inner.update_message();
+        }
+    }
+
+    fn add_bytes(&self, bytes: u64) {
+        if let Some(inner) = &self.inner {
+            inner.bytes.fetch_add(bytes, Ordering::Relaxed);
+            inner.update_message();
+        }
+    }
+
+    fn finish_success(&self) {
+        if let Some(inner) = &self.inner {
+            inner.finish_with_message("done");
+        }
+    }
+
+    fn finish_error(&self) {
+        if let Some(inner) = &self.inner {
+            inner.finish_with_message("failed");
+        }
+    }
+}
+
+impl ProgressInner {
+    fn update_message(&self) {
+        let files = self.files.load(Ordering::Relaxed);
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        self.bar
+            .set_message(format!("{files} files - {}", HumanBytes(bytes)));
+    }
+
+    fn finish_with_message(&self, status: &str) {
+        if self
+            .finished
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.bar
+                .finish_with_message(format!("{status} - {}", self.bar.message()));
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -39,15 +158,41 @@ fn main() -> Result<()> {
 }
 
 fn run(args: Args) -> Result<()> {
+    if args.extract {
+        let output = args.output.clone().unwrap_or_else(|| PathBuf::from("."));
+        let progress = ProgressReporter::new("extracting", progress_allowed(args.no_progress));
+        let result = run_extract(&args, output, progress.clone());
+        match &result {
+            Ok(_) => progress.finish_success(),
+            Err(_) => progress.finish_error(),
+        }
+        return result;
+    }
+
     if args.chunk_size == 0 {
         bail!("chunk-size must be greater than zero");
     }
 
+    let progress = ProgressReporter::new("archiving", progress_allowed(args.no_progress));
+    let result = run_archive(&args, progress.clone());
+    match &result {
+        Ok(_) => progress.finish_success(),
+        Err(_) => progress.finish_error(),
+    }
+    result
+}
+
+fn run_archive(args: &Args, progress: ProgressReporter) -> Result<()> {
     let jobs = args.jobs.unwrap_or_else(default_jobs).max(1);
 
-    let canonical_root = fs::canonicalize(&args.input)
-        .with_context(|| format!("failed to resolve {}", args.input.display()))?;
-    let tar_root = sanitize_tar_root(&args.input);
+    let input = args
+        .input
+        .as_ref()
+        .context("PATH is required unless --extract is provided")?;
+
+    let canonical_root = fs::canonicalize(input)
+        .with_context(|| format!("failed to resolve {}", input.display()))?;
+    let tar_root = sanitize_tar_root(input);
     let abort = AbortSignal::new();
 
     let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Chunk>(jobs * 4);
@@ -56,7 +201,12 @@ fn run(args: Args) -> Result<()> {
     let writer_abort = abort.clone();
     let writer_handle = thread::Builder::new()
         .name("rargz-writer".to_string())
-        .spawn(move || write_compressed_stream(result_rx, writer_abort))?;
+        .spawn({
+            let format = args.format.clone();
+            let progress = progress.clone();
+            let chunk_size = args.chunk_size;
+            move || write_compressed_stream(result_rx, writer_abort, format, chunk_size, progress)
+        })?;
 
     let pool = ThreadPoolBuilder::new()
         .num_threads(jobs)
@@ -81,6 +231,7 @@ fn run(args: Args) -> Result<()> {
         chunk_tx,
         args.chunk_size,
         &abort,
+        progress.clone(),
     );
 
     // Ensure all tasks complete before observing the outcome.
@@ -102,19 +253,180 @@ fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+fn run_extract(args: &Args, output: PathBuf, progress: ProgressReporter) -> Result<()> {
+    let jobs = args.jobs.unwrap_or_else(default_jobs).max(1);
+
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+
+    match detect_input_format(&mut reader)? {
+        InputFormat::TarZst => extract_tar_zst(reader, &output, progress),
+        InputFormat::Rargz { chunk_size } => extract_rargz(reader, &output, jobs, chunk_size, progress),
+    }
+}
+
+fn detect_input_format<R: BufRead>(reader: &mut R) -> Result<InputFormat> {
+    let buffer = reader.fill_buf()?;
+    if buffer.len() >= RARGZ_MAGIC.len() && &buffer[..RARGZ_MAGIC.len()] == RARGZ_MAGIC {
+        reader.consume(RARGZ_MAGIC.len());
+
+        let mut version = [0u8; 1];
+        reader.read_exact(&mut version)?;
+        if version[0] != RARGZ_VERSION {
+            bail!("unsupported rargz version {}", version[0]);
+        }
+
+        let mut chunk_buf = [0u8; 8];
+        reader.read_exact(&mut chunk_buf)?;
+        let chunk_size = u64::from_le_bytes(chunk_buf);
+        let chunk_size = usize::try_from(chunk_size).context("chunk size exceeds addressable space")?;
+        if chunk_size == 0 {
+            bail!("invalid chunk size found in rargz header");
+        }
+
+        Ok(InputFormat::Rargz { chunk_size })
+    } else {
+        Ok(InputFormat::TarZst)
+    }
+}
+
+fn extract_tar_zst<R: Read>(reader: R, output: &Path, progress: ProgressReporter) -> Result<()> {
+    let decoder = ZstdDecoder::new(reader).context("failed to initialize zstd decoder")?;
+    extract_tar_from_reader(decoder, output, progress)
+}
+
+fn extract_rargz<R: Read>(
+    mut reader: R,
+    output: &Path,
+    jobs: usize,
+    chunk_size: usize,
+    progress: ProgressReporter,
+) -> Result<()> {
+    let abort = AbortSignal::new();
+    let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<CompressedChunk>(jobs * 4);
+    let (plain_tx, plain_rx) = crossbeam_channel::bounded::<Result<Chunk>>(jobs * 4);
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .thread_name(|index| format!("rargz-decompress-{index}"))
+        .build()
+        .context("failed to create decompression pool")?;
+
+    for _ in 0..jobs {
+        let worker_rx = chunk_rx.clone();
+        let worker_tx = plain_tx.clone();
+        let worker_abort = abort.clone();
+        pool.spawn(move || decompression_worker(worker_rx, worker_tx, worker_abort, chunk_size));
+    }
+
+    drop(plain_tx);
+    drop(chunk_rx);
+
+    let extraction_progress = progress.clone();
+    let output_path = output.to_path_buf();
+    let extraction_abort = abort.clone();
+    let extractor_handle = thread::Builder::new()
+        .name("rargz-untar".to_string())
+        .spawn(move || {
+            let reader = ChunkStreamReader::new(plain_rx, extraction_abort);
+            extract_tar_from_reader(reader, &output_path, extraction_progress)
+        })?;
+
+    let feed_result = feed_rargz_chunks(&mut reader, &chunk_tx, &abort);
+    drop(chunk_tx);
+
+    drop(pool);
+
+    let extraction_result = match extractor_handle.join() {
+        Ok(res) => res,
+        Err(_) => Err(anyhow!("extraction thread panicked")),
+    };
+
+    feed_result?;
+    extraction_result?;
+
+    if abort.is_set() {
+        bail!("extraction aborted due to a prior error");
+    }
+
+    Ok(())
+}
+
+fn feed_rargz_chunks<R: Read>(
+    reader: &mut R,
+    chunk_tx: &Sender<CompressedChunk>,
+    abort: &AbortSignal,
+) -> Result<()> {
+    let mut index = 0u64;
+    let mut len_buf = [0u8; 8];
+
+    loop {
+        if abort.is_set() {
+            return Ok(());
+        }
+
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {
+                let chunk_len = u64::from_le_bytes(len_buf) as usize;
+                if chunk_len == 0 {
+                    continue;
+                }
+                let mut data = vec![0u8; chunk_len];
+                reader
+                    .read_exact(&mut data)
+                    .with_context(|| format!("failed to read chunk {index}"))?;
+                chunk_tx
+                    .send(CompressedChunk { index, data })
+                    .map_err(|_| anyhow!("decompression pipeline closed"))?;
+                index += 1;
+            }
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_tar_from_reader<R: Read>(
+    reader: R,
+    output: &Path,
+    progress: ProgressReporter,
+) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    let mut entries = archive.entries().context("failed to iterate over tar entries")?;
+
+    while let Some(entry) = entries.next() {
+        let mut entry = entry?;
+        let size = entry.size();
+        let path = entry
+            .path()
+            .context("failed to resolve entry path")?
+            .to_path_buf();
+        progress.record_file();
+        entry
+            .unpack_in(output)
+            .with_context(|| format!("failed to unpack {}", path.display()))?;
+        progress.add_bytes(size);
+    }
+
+    Ok(())
+}
+
 fn produce_tar_stream(
     canonical_root: &Path,
     tar_root: &Path,
     chunk_tx: Sender<Chunk>,
     chunk_size: usize,
     abort: &AbortSignal,
+    progress: ProgressReporter,
 ) -> Result<()> {
-    let chunk_writer = ChunkWriter::new(chunk_tx, chunk_size, abort.clone());
+    let chunk_writer = ChunkWriter::new(chunk_tx, chunk_size, abort.clone(), progress.clone());
     let mut builder = tar::Builder::new(chunk_writer);
     builder.follow_symlinks(false);
     builder.mode(tar::HeaderMode::Deterministic);
 
-    write_entries(&mut builder, canonical_root, tar_root, abort)?;
+    write_entries(&mut builder, canonical_root, tar_root, abort, &progress)?;
     builder.finish().context("failed to finish tar archive")?;
 
     let mut chunk_writer = builder.into_inner().context("failed to flush tar writer")?;
@@ -129,6 +441,7 @@ fn write_entries<W: Write>(
     canonical_root: &Path,
     tar_root: &Path,
     abort: &AbortSignal,
+    progress: &ProgressReporter,
 ) -> Result<()> {
     let walker = WalkDir::new(canonical_root).follow_links(false);
 
@@ -151,6 +464,7 @@ fn write_entries<W: Write>(
             tar_path.push(rel);
         }
 
+        progress.record_file();
         builder
             .append_path_with_name(entry.path(), &tar_path)
             .with_context(|| format!("failed to archive {}", entry.path().display()))?;
@@ -200,13 +514,66 @@ fn compression_worker(
     }
 }
 
+fn decompression_worker(
+    chunk_rx: Receiver<CompressedChunk>,
+    result_tx: Sender<Result<Chunk>>,
+    abort: AbortSignal,
+    chunk_capacity: usize,
+) {
+    let mut decompressor = match Decompressor::new() {
+        Ok(d) => d,
+        Err(err) => {
+            abort.request();
+            let _ = result_tx.send(Err(anyhow!("failed to create zstd decompressor: {err}")));
+            return;
+        }
+    };
+
+    for chunk in chunk_rx.iter() {
+        if abort.is_set() {
+            break;
+        }
+
+        match decompressor.decompress(&chunk.data, chunk_capacity) {
+            Ok(data) => {
+                if result_tx
+                    .send(Ok(Chunk {
+                        index: chunk.index,
+                        data,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(err) => {
+                abort.request();
+                let _ = result_tx.send(Err(anyhow!("decompression failed: {err}")));
+                break;
+            }
+        }
+    }
+}
+
+const RARGZ_MAGIC: &[u8; 6] = b"RARGZ\0";
+const RARGZ_VERSION: u8 = 1;
+
 fn write_compressed_stream(
     result_rx: Receiver<Result<CompressedChunk>>,
     abort: AbortSignal,
+    format: ArchiveFormat,
+    chunk_size: usize,
+    _progress: ProgressReporter,
 ) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let mut pending = BTreeMap::<u64, Vec<u8>>::new();
     let mut next_index = 0u64;
+
+    if let ArchiveFormat::Rargz = format {
+        stdout.write_all(RARGZ_MAGIC)?;
+        stdout.write_all(&[RARGZ_VERSION])?;
+        stdout.write_all(&(chunk_size as u64).to_le_bytes())?;
+    }
 
     for item in result_rx {
         let chunk = match item {
@@ -220,6 +587,14 @@ fn write_compressed_stream(
         pending.insert(chunk.index, chunk.data);
 
         while let Some(data) = pending.remove(&next_index) {
+            if let ArchiveFormat::Rargz = format {
+                let len = data.len() as u64;
+                if let Err(err) = stdout.write_all(&len.to_le_bytes()) {
+                    abort.request();
+                    return Err(err.into());
+                }
+            }
+
             if let Err(err) = stdout.write_all(&data) {
                 abort.request();
                 return Err(err.into());
@@ -264,22 +639,116 @@ struct CompressedChunk {
     data: Vec<u8>,
 }
 
+struct ChunkStreamReader {
+    rx: Receiver<Result<Chunk>>,
+    pending: BTreeMap<u64, Vec<u8>>,
+    next_index: u64,
+    current: Option<Vec<u8>>,
+    offset: usize,
+    abort: AbortSignal,
+}
+
+impl ChunkStreamReader {
+    fn new(rx: Receiver<Result<Chunk>>, abort: AbortSignal) -> Self {
+        Self {
+            rx,
+            pending: BTreeMap::new(),
+            next_index: 0,
+            current: None,
+            offset: 0,
+            abort,
+        }
+    }
+
+    fn ensure_buffer(&mut self) -> io::Result<bool> {
+        loop {
+            if let Some(ref data) = self.current {
+                if self.offset < data.len() {
+                    return Ok(true);
+                } else {
+                    self.current = None;
+                    self.offset = 0;
+                }
+            }
+
+            if let Some(data) = self.pending.remove(&self.next_index) {
+                self.next_index += 1;
+                self.current = Some(data);
+                continue;
+            }
+
+            if self.abort.is_set() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "extraction aborted",
+                ));
+            }
+
+            match self.rx.recv() {
+                Ok(Ok(chunk)) => {
+                    if chunk.index == self.next_index {
+                        self.next_index += 1;
+                        self.current = Some(chunk.data);
+                    } else {
+                        self.pending.insert(chunk.index, chunk.data);
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.abort.request();
+                    return Err(io::Error::new(io::ErrorKind::Other, err.to_string()));
+                }
+                Err(_) => return Ok(false),
+            }
+        }
+    }
+}
+
+impl Read for ChunkStreamReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if !self.ensure_buffer()? {
+            return Ok(0);
+        }
+
+        let data = self.current.as_ref().expect("buffer should be available");
+        let available = &data[self.offset..];
+        let to_copy = available.len().min(buf.len());
+        buf[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.offset += to_copy;
+        if self.offset == data.len() {
+            self.current = None;
+            self.offset = 0;
+        }
+        Ok(to_copy)
+    }
+}
+
 struct ChunkWriter {
     tx: Sender<Chunk>,
     buffer: Vec<u8>,
     chunk_size: usize,
     next_index: u64,
     abort: AbortSignal,
+    progress: ProgressReporter,
 }
 
 impl ChunkWriter {
-    fn new(tx: Sender<Chunk>, chunk_size: usize, abort: AbortSignal) -> Self {
+    fn new(
+        tx: Sender<Chunk>,
+        chunk_size: usize,
+        abort: AbortSignal,
+        progress: ProgressReporter,
+    ) -> Self {
         Self {
             tx,
             buffer: Vec::with_capacity(chunk_size),
             chunk_size,
             next_index: 0,
             abort,
+            progress,
         }
     }
 
@@ -301,6 +770,7 @@ impl ChunkWriter {
         let mut data = Vec::with_capacity(self.buffer.len());
         data.extend_from_slice(&self.buffer);
         self.buffer.clear();
+        self.progress.add_bytes(data.len() as u64);
         let chunk = Chunk {
             index: self.next_index,
             data,
@@ -344,26 +814,10 @@ impl Write for ChunkWriter {
 }
 
 fn sanitize_tar_root(input: &Path) -> PathBuf {
-    let mut root = PathBuf::new();
-    for component in input.components() {
-        match component {
-            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
-            Component::RootDir => {}
-            Component::CurDir => {
-                if root.as_os_str().is_empty() {
-                    root.push(".");
-                }
-            }
-            Component::ParentDir => root.push(".."),
-            Component::Normal(part) => root.push(part),
-        }
-    }
-
-    if root.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        root
-    }
+    input
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn default_jobs() -> usize {

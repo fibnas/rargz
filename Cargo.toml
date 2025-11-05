@@ -12,3 +12,5 @@ rayon = "1.10"
 tar = "0.4"
 walkdir = "2.5"
 zstd = { version = "0.13", features = ["zstdmt"] }
+indicatif = "0.17"
+atty = "0.2"
