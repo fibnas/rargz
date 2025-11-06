@@ -6,6 +6,8 @@
 
 `rargz` is a fast parallel tar + zstd archiver. It walks a directory, emits a deterministic tar stream, and compresses chunks concurrently with independent zstd workers.
 
+<img width="805" height="379" alt="rargz" src="https://github.com/user-attachments/assets/27be47b0-d7d2-4b0b-b38f-82c49104c397" />
+
 ## Features
 
 - Parallel tar stream generation with independent zstd workers
