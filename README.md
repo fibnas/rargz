@@ -20,8 +20,6 @@
 
 <img width="1016" height="488" alt="rargz-h" src="https://github.com/user-attachments/assets/d20c01d3-ded6-4243-80f1-c53f22d2f205" />
 
-<img width="1016" height="488" alt="rargz-h" src="https://github.com/user-attachments/assets/d20c01d3-ded6-4243-80f1-c53f22d2f205" />
-
 ## Installation
 
 ```bash
