@@ -6,14 +6,19 @@
 
 `rargz` is a fast parallel tar + zstd archiver. It walks a directory, emits a deterministic tar stream, and compresses chunks concurrently with independent zstd workers.
 
+> 671,352 files → 27 seconds:
+
+<img width="805" height="379" alt="rargz" src="https://github.com/user-attachments/assets/27be47b0-d7d2-4b0b-b38f-82c49104c397" />
+
 ## Features
 
 - Parallel tar stream generation with independent zstd workers
 - Optional progress indicator (auto-disables when stderr is not a TTY)
 - Produces standard `.tar.zst` by default (compatible with `tar --zstd` or `zstd -d`)
-- Opt-in `.rargz` chunked format with cooperative parallel decompression
-- Streaming extraction (`stdin` to filesystem) with automatic format detection
-- Metadata inspection via `--list` and `--count`
+- Optional `.rargz` chunked format (designed for future parallel decompression)
+- Streaming extraction (`stdin` to filesystem)
+
+<img width="1016" height="488" alt="rargz-h" src="https://github.com/user-attachments/assets/d20c01d3-ded6-4243-80f1-c53f22d2f205" />
 
 ## Installation
 
@@ -41,46 +46,39 @@ Enable the chunked `.rargz` format:
 rargz --format rargz path/to/input > archive.rargz
 ```
 
-Tune chunk size and thread count:
+Tune chunk size (bytes) and thread count:
 
 ```bash
-rargz --chunk-size 4MiB --jobs 8 path/to/input > archive.tar.zst
+rargz --chunk-size 4194304 --jobs 8 path/to/input > archive.tar.zst
 ```
 
-Disable the progress spinner explicitly when scripting:
+Raise the compression level (zstd 1–22, default 3) and silence the progress spinner:
 
 ```bash
-rargz --no-progress path/to/input > archive.tar.zst
+rargz --level 9 --no-progress path/to/input > archive.tar.zst
 ```
 
 ## Extraction
 
-Extraction reads from stdin (or a path argument) and writes the output to the directory specified with `-o/--output`:
+Extraction reads from stdin and writes the output to the directory specified with `-o/--output`:
 
 ```bash
-rargz --extract archive.tar.zst -o ./output
+rargz --extract -o /path/to/output < archive.tar.zst
 ```
-
-Or stream over stdin:
+or
 
 ```bash
-cat archive.tar.zst | rargz --extract -o ./output
+cat archive.tar.zst | rargz --extract -o /path/to/output
 ```
 
-`rargz` auto-detects plain `.tar.zst` streams versus chunked `.rargz` streams. Standard archives are decompressed sequentially for compatibility. Chunked archives fan out to the worker pool for parallel decompression and untar.
+`.tar.zst` streams are decompressed sequentially for compatibility.  
+`.rargz` streams are chunked and designed for parallel decompression (WIP until format is finalized).
 
-Progress is enabled by default; disable it with `--no-progress` or by piping stderr.
-
-## Inspecting archives
-
-Scan metadata without unpacking by either piping the archive or passing it as an argument:
+You can also extract directly from a file without an explicit pipe:
 
 ```bash
-rargz --list archive.tar.zst
-rargz --count archive.rargz
+rargz --extract -o /path/to/output archive.tar.zst
 ```
-
-`--list` prints each entry path (similar to `tar -tf`), while `--count` emits a single total. Both modes skip extracting payloads and work with either format. When no path is supplied, the commands read from stdin (so you can still pipe data in).
 
 ## Format details
 
@@ -88,7 +86,34 @@ rargz --count archive.rargz
   - `tar --zstd -xf archive.tar.zst`
   - `zstd -d archive.tar.zst | tar -xf -`
 
-- `.rargz` mode adds a small header (`RARGZ\0`, version, chunk size) and length-prefixes each compressed chunk. The extra framing allows `rargz` to decompress different chunks in parallel during extraction or inspection.
+- `.rargz` mode adds a small header (`RARGZ\0`, version, chunk size) and length-prefixes each compressed chunk. This enables random access and parallel decompression.
+
+## Inspection
+
+Read-only operations work on both `.tar.zst` and `.rargz` streams supplied via a file or stdin.
+
+- `--list` prints every entry path:
+
+  ```bash
+  rargz --list archive.tar.zst
+  # or
+  rargz --list < archive.tar.zst
+  ```
+
+- `--count` reports how many entries are present:
+
+  ```bash
+  rargz --count archive.tar.zst
+  ```
+
+Both modes consume the entire archive to validate it; they exit non-zero on structural errors.
+
+## Performance notes
+
+- `--jobs` controls the compression worker pool (defaults to the number of logical CPUs).
+- `--chunk-size` specifies the amount of tar data each compressor sees at once; larger chunks improve ratio, smaller chunks reduce memory per worker.
+- `--format rargz` emits independently compressed chunks with a lightweight header for future parallel extraction support.
+- `--no-progress` disables the progress indicator (also auto-disables when stderr is not a TTY).
 
 ## Safety
 
