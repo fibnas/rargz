@@ -28,7 +28,10 @@ enum ArchiveFormat {
 #[command(name = "rargz", version, about = "Parallel tar + zstd archiver/extractor")]
 struct Args {
     /// Directory or file to archive.
-    #[arg(value_name = "PATH", required_unless_present("extract"))]
+    #[arg(
+        value_name = "PATH",
+        required_unless_present_any = ["extract", "list", "count"]
+    )]
     input: Option<PathBuf>,
 
     /// Zstd compression level.
@@ -44,16 +47,24 @@ struct Args {
     jobs: Option<usize>,
 
     /// Extract from stdin into the output directory.
-    #[arg(short = 'x', long)]
+    #[arg(short = 'x', long, conflicts_with_all = ["list", "count"])]
     extract: bool,
 
     /// Output directory for extraction.
-    #[arg(short = 'o', long, value_name = "DIR")]
+    #[arg(short = 'o', long, value_name = "DIR", requires = "extract")]
     output: Option<PathBuf>,
 
     /// Output format for the archive.
     #[arg(long, default_value_t = ArchiveFormat::TarZst, value_enum)]
     format: ArchiveFormat,
+
+    /// List the archive contents from stdin.
+    #[arg(long, conflicts_with_all = ["extract", "count"])]
+    list: bool,
+
+    /// Count items in the archive from stdin.
+    #[arg(long, conflicts_with_all = ["extract", "list"])]
+    count: bool,
 
     /// Disable progress reporting.
     #[arg(long)]
@@ -79,6 +90,11 @@ struct ProgressInner {
 enum InputFormat {
     TarZst,
     Rargz { chunk_size: usize },
+}
+
+enum InspectionMode {
+    List,
+    Count,
 }
 
 impl ProgressReporter {
@@ -169,6 +185,14 @@ fn run(args: Args) -> Result<()> {
         return result;
     }
 
+    if args.list {
+        return run_inspect(&args, InspectionMode::List);
+    }
+
+    if args.count {
+        return run_inspect(&args, InspectionMode::Count);
+    }
+
     if args.chunk_size == 0 {
         bail!("chunk-size must be greater than zero");
     }
@@ -256,13 +280,94 @@ fn run_archive(args: &Args, progress: ProgressReporter) -> Result<()> {
 fn run_extract(args: &Args, output: PathBuf, progress: ProgressReporter) -> Result<()> {
     let jobs = args.jobs.unwrap_or_else(default_jobs).max(1);
 
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-
-    match detect_input_format(&mut reader)? {
-        InputFormat::TarZst => extract_tar_zst(reader, &output, progress),
-        InputFormat::Rargz { chunk_size } => extract_rargz(reader, &output, jobs, chunk_size, progress),
+    if let Some(path) = args.input.as_ref() {
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        return extract_from_reader(BufReader::new(file), jobs, &output, progress);
     }
+
+    if atty::is(Stream::Stdin) {
+        bail!("no input provided; pipe an archive or pass PATH");
+    }
+
+    let stdin = io::stdin();
+    let reader = BufReader::new(stdin.lock());
+    extract_from_reader(reader, jobs, &output, progress)
+}
+
+fn extract_from_reader<R>(
+    mut reader: R,
+    jobs: usize,
+    output: &Path,
+    progress: ProgressReporter,
+) -> Result<()>
+where
+    R: Read + BufRead,
+{
+    match detect_input_format(&mut reader)? {
+        InputFormat::TarZst => extract_tar_zst(reader, output, progress),
+        InputFormat::Rargz { chunk_size } => extract_rargz(reader, output, jobs, chunk_size, progress),
+    }
+}
+
+fn run_inspect(args: &Args, mode: InspectionMode) -> Result<()> {
+    if let Some(path) = args.input.as_ref() {
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        return inspect_from_reader(BufReader::new(file), mode);
+    }
+
+    if atty::is(Stream::Stdin) {
+        bail!("no input provided; pipe an archive or pass PATH");
+    }
+
+    let stdin = io::stdin();
+    inspect_from_reader(BufReader::new(stdin.lock()), mode)
+}
+
+fn inspect_from_reader<R>(mut reader: R, mode: InspectionMode) -> Result<()>
+where
+    R: Read + BufRead,
+{
+    match detect_input_format(&mut reader)? {
+        InputFormat::TarZst => {
+            let decoder =
+                ZstdDecoder::new(reader).context("failed to initialize zstd decoder")?;
+            inspect_tar_stream(decoder, mode)
+        }
+        InputFormat::Rargz { chunk_size } => {
+            let seq_reader =
+                RargzSequentialReader::new(reader, chunk_size).context("failed to prepare rargz reader")?;
+            inspect_tar_stream(seq_reader, mode)
+        }
+    }
+}
+
+fn inspect_tar_stream<R: Read>(reader: R, mode: InspectionMode) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    let mut entries = archive
+        .entries()
+        .context("failed to iterate over tar entries")?;
+    let mut total = 0u64;
+
+    while let Some(entry) = entries.next() {
+        let mut entry = entry?;
+        let path = entry
+            .path()
+            .context("failed to resolve entry path")?
+            .to_path_buf();
+        total += 1;
+        if let InspectionMode::List = mode {
+            println!("{}", path.display());
+        }
+        io::copy(&mut entry, &mut io::sink()).context("failed to advance past archive entry")?;
+    }
+
+    if let InspectionMode::Count = mode {
+        println!("{total}");
+    }
+
+    Ok(())
 }
 
 fn detect_input_format<R: BufRead>(reader: &mut R) -> Result<InputFormat> {
@@ -724,6 +829,117 @@ impl Read for ChunkStreamReader {
         }
         Ok(to_copy)
     }
+}
+
+struct RargzSequentialReader<R> {
+    reader: R,
+    decompressor: Decompressor<'static>,
+    chunk_capacity: usize,
+    buffer: Vec<u8>,
+    offset: usize,
+    finished: bool,
+}
+
+impl<R: Read> RargzSequentialReader<R> {
+    fn new(reader: R, chunk_capacity: usize) -> io::Result<Self> {
+        let decompressor =
+            Decompressor::new().map_err(|err| io::Error::new(ErrorKind::Other, err.to_string()))?;
+        Ok(Self {
+            reader,
+            decompressor,
+            chunk_capacity,
+            buffer: Vec::new(),
+            offset: 0,
+            finished: false,
+        })
+    }
+
+    fn refill(&mut self) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+
+        let mut len_buf = [0u8; 8];
+        if !read_exact_or_eof(&mut self.reader, &mut len_buf)? {
+            self.finished = true;
+            self.buffer.clear();
+            self.offset = 0;
+            return Ok(());
+        }
+
+        let chunk_len = usize::try_from(u64::from_le_bytes(len_buf))
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "chunk length exceeds usize"))?;
+
+        let mut compressed = vec![0u8; chunk_len];
+        if chunk_len > 0 {
+            read_exact_checked(&mut self.reader, &mut compressed)
+                .map_err(|err| io::Error::new(err.kind(), format!("failed to read chunk: {err}")))?;
+        }
+
+        let data = self
+            .decompressor
+            .decompress(&compressed, self.chunk_capacity)
+            .map_err(|err| io::Error::new(ErrorKind::Other, format!("decompression failed: {err}")))?;
+        self.offset = 0;
+        self.buffer = data;
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for RargzSequentialReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if self.offset == self.buffer.len() {
+            self.refill()?;
+        }
+
+        if self.offset == self.buffer.len() {
+            return Ok(0);
+        }
+
+        let available = &self.buffer[self.offset..];
+        let to_copy = available.len().min(buf.len());
+        buf[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.offset += to_copy;
+        Ok(to_copy)
+    }
+}
+
+fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+    let mut read = 0;
+    while read < buf.len() {
+        let n = reader.read(&mut buf[read..])?;
+        if n == 0 {
+            return if read == 0 {
+                Ok(false)
+            } else {
+                Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading chunk header",
+                ))
+            };
+        }
+        read += n;
+    }
+    Ok(true)
+}
+
+fn read_exact_checked<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
+    let mut read = 0;
+    while read < buf.len() {
+        let n = reader.read(&mut buf[read..])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "unexpected EOF while reading chunk body",
+            ));
+        }
+        read += n;
+    }
+    Ok(())
 }
 
 struct ChunkWriter {
