@@ -57,7 +57,12 @@ rargz --chunk-size 4MiB --jobs 8 path/to/input > archive.tar.zst
 Extraction reads from stdin and writes the output to the directory specified with `-o/--output`:
 
 ```bash
-cat archive.tar.zst | rargz --extract -o ./output
+rargz --extract -o /path/to/output < archive.tar.zst
+```
+or
+
+```bash
+cat archive.tar.zst | rargz --extract -o /path/to/output
 ```
 
 `.tar.zst` streams are decompressed sequentially for compatibility.  
