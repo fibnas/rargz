@@ -18,8 +18,7 @@
 - Optional `.rargz` chunked format (designed for future parallel decompression)
 - Streaming extraction (`stdin` to filesystem)
 
-<img width="822" height="505" alt="rargz-h" src="https://github.com/user-attachments/assets/5bf16c03-87a3-43ff-b5d8-da75f7bfb1c6" />
-
+<img width="1016" height="488" alt="rargz-h" src="https://github.com/user-attachments/assets/d20c01d3-ded6-4243-80f1-c53f22d2f205" />
 
 ## Installation
 
